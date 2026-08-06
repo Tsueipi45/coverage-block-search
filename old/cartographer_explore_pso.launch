@@ -1,0 +1,187 @@
+<?xml version="1.0"?>
+<!-- cartographer_explore_pso.launch
+     Autonomous SLAM exploration with Cartographer + explore_lite
+     using PSO global planner + PSO-LQR local planner.
+
+     Replaces the default global/local planners in move_base with:
+       - PSO Global Planner  (pso_global_planner)
+       - PSOLQR Local Planner (psolqr_local_planner)
+
+     Prerequisites:
+       cd ~/experiment_ws/src
+       cp -r /path/to/pso_global_planner-master ./pso_global_planner
+       cp -r /path/to/psolqr_local_planner-master ./psolqr_local_planner
+       cd ~/experiment_ws && catkin_make && source devel/setup.bash
+
+     Usage:
+       roslaunch coverage_block_search cartographer_explore_pso.launch
+-->
+<launch>
+    <!-- ======== Args ======== -->
+    <arg name="start_driver"     default="true"/>
+    <arg name="start_lidar"      default="true"/>
+    <arg name="use_lidar_filter" default="true"/>
+    <arg name="start_camera"     default="false"/>
+
+    <arg name="scan_raw_topic" default="/scan_raw"/>
+    <arg name="scan_topic"     default="/scan"/>
+    <arg name="cmd_vel_topic"  default="/controller/cmd_vel"/>
+    <arg name="odom_topic"     default="odom_raw"/>
+    <arg name="map_frame"      default="map"/>
+    <arg name="odom_frame"     default="odom"/>
+    <arg name="base_frame"     default="base_footprint"/>
+    <arg name="lidar_frame"    default="lidar_frame"/>
+
+    <!-- ======== Layer 1: Hardware Drivers ======== -->
+
+    <!-- Chassis driver + EKF fusion -->
+    <include if="$(arg start_driver)" file="$(find driver)/launch/ekf_fusion.launch"/>
+
+    <!-- Lidar driver (publishes /scan_raw) -->
+    <include if="$(eval start_lidar and use_lidar_filter)" file="$(find lidar_driver)/launch/ld_lidar.launch">
+        <arg name="topic_name" value="$(arg scan_raw_topic)"/>
+    </include>
+
+    <!-- Lidar angle filter: /scan_raw -> /scan -->
+    <node if="$(eval start_lidar and use_lidar_filter)" pkg="laser_filters"
+          type="scan_to_scan_filter_chain" output="screen" name="coverage_laser_filter">
+        <rosparam ns="scan_filter_chain" subst_value="true">
+            - name: angle
+              type: laser_filters/LaserScanAngularBoundsFilterInPlace
+              params:
+                lower_angle: 1.54
+                upper_angle: 4.71
+        </rosparam>
+        <remap from="scan" to="$(arg scan_raw_topic)"/>
+        <remap from="scan_filtered" to="$(arg scan_topic)"/>
+    </node>
+
+    <include if="$(eval start_lidar and not use_lidar_filter)" file="$(find lidar_driver)/launch/ld_lidar.launch">
+        <arg name="topic_name" value="$(arg scan_topic)"/>
+    </include>
+
+    <!-- ======== Layer 2: TF Publishers ======== -->
+
+    <node pkg="tf" type="static_transform_publisher" name="base_to_lidar"
+          args="0 0 0.1 3.14 0 0 $(arg base_frame) $(arg lidar_frame) 20"/>
+    <node pkg="tf" type="static_transform_publisher" name="base_to_imu"
+          args="0 0 0.0 1.57 3.14 0 $(arg base_frame) imu_frame 20"/>
+
+    <!-- ======== Layer 3: Cartographer SLAM ======== -->
+
+    <param name="/use_sim_time" value="false" />
+
+    <node name="cartographer_node" pkg="cartographer_ros"
+          type="cartographer_node" args="
+              -configuration_directory $(find cartographer_ros)/configuration_files
+              -configuration_basename my_robot_2d.lua"
+          output="screen">
+        <remap from="scan" to="$(arg scan_topic)"/>
+        <remap from="imu" to="/imu_corrected"/>
+        <remap from="odom" to="/odom"/>
+    </node>
+
+    <node name="cartographer_occupancy_grid_node" pkg="cartographer_ros"
+          type="cartographer_occupancy_grid_node" args="-resolution 0.05">
+        <remap from="map" to="/cartographer_map_raw"/>
+    </node>
+
+    <!-- Map converter: Cartographer probability (0-255) → standard 3-value -->
+    <node pkg="robot_slam_navigation" type="cartographer_map_converter.py"
+          name="map_converter" output="screen">
+        <param name="output_topic" value="/cmap"/>
+        <param name="obstacle_threshold" value="60"/>
+        <param name="free_threshold" value="30"/>
+    </node>
+
+    <!-- ======== Layer 4: move_base ======== -->
+
+    <include file="$(find robot_slam_navigation)/launch/move_base.launch">
+        <arg name="cmd_vel_topic" value="$(arg cmd_vel_topic)"/>
+        <arg name="global_costmap_map_topic" value="cmap"/>
+        <arg name="global_costmap_sensor_frame" value="$(arg base_frame)"/>
+        <arg name="global_costmap_sensor_topic" value="$(arg scan_topic)"/>
+        <arg name="global_costmap_global_frame" value="$(arg map_frame)"/>
+        <arg name="global_costmap_robot_base_frame" value="$(arg base_frame)"/>
+        <arg name="local_costmap_map_topic" value="map"/>
+        <arg name="local_costmap_sensor_frame" value="$(arg base_frame)"/>
+        <arg name="local_costmap_sensor_topic" value="$(arg scan_topic)"/>
+        <arg name="local_costmap_global_frame" value="$(arg odom_frame)"/>
+        <arg name="local_costmap_robot_base_frame" value="$(arg base_frame)"/>
+        <arg name="teb_odom_topic" value="$(arg odom_topic)"/>
+        <arg name="teb_map_frame" value="$(arg odom_frame)"/>
+    </include>
+
+    <!-- ======== PSO Planner Parameters ======== -->
+
+    <!-- PSO Global Planner params
+         Plugin looks up params at ~/pso_planner/globalMotionPlannerROS/
+         ns="/move_base/pso_planner" + yaml key "globalMotionPlannerROS"
+         → /move_base/pso_planner/globalMotionPlannerROS/n_particles ✓ -->
+    <rosparam file="$(find pso_global_planner)/params/pso_planner.yaml"
+              command="load" ns="/move_base/pso_planner"/>
+
+    <!-- PSOLQR Local Planner params
+         Plugin looks up params at ~/psolqr_planner/PsoLqrPlanner/
+         ns="/move_base/psolqr_planner" + yaml key "PsoLqrPlanner"
+         → /move_base/psolqr_planner/PsoLqrPlanner/n_particles ✓ -->
+    <rosparam file="$(find psolqr_local_planner)/config/psolqr_planner_params.yaml"
+              command="load" ns="/move_base/psolqr_planner"/>
+
+    <!-- ======== Override move_base params ======== -->
+
+    <!-- Replace default planners with PSO variants -->
+    <param name="/move_base/base_global_planner" value="pso_planner/globalMotionPlannerROS"/>
+    <param name="/move_base/base_local_planner" value="psolqr_planner/PsoLqrPlanner"/>
+
+    <param name="/move_base/recovery_behavior_enabled" value="false"/>
+    <param name="/move_base/clearing_rotation_allowed" value="false"/>
+    <param name="/move_base/controller_frequency" value="10.0"/>
+    <param name="/move_base/planner_frequency" value="3.0"/>
+
+    <!-- track_unknown_space MUST be true for explore_lite to find frontiers -->
+    <param name="/move_base/global_costmap/obstacle_layer/track_unknown_space" value="true"/>
+
+    <param name="/move_base/global_costmap/global_frame" value="map"/>
+    <param name="/move_base/global_costmap/static_map" value="true"/>
+    <param name="/move_base/global_costmap/width" value="1000"/>
+    <param name="/move_base/global_costmap/height" value="1000"/>
+    <param name="/move_base/global_costmap/origin_x" value="-25.0"/>
+    <param name="/move_base/global_costmap/origin_y" value="-25.0"/>
+    <param name="/move_base/global_costmap/resolution" value="0.05"/>
+    <param name="/move_base/global_costmap/transform_tolerance" value="10.0"/>
+    <param name="/move_base/local_costmap/transform_tolerance" value="10.0"/>
+    <param name="/move_base/planner_patience" value="10.0"/>
+    <param name="/move_base/controller_patience" value="10.0"/>
+    <param name="/move_base/xy_goal_tolerance" value="0.3"/>
+    <param name="/move_base/yaw_goal_tolerance" value="0.3"/>
+    <param name="/move_base/global_costmap/update_frequency" value="5.0"/>
+
+    <!-- Override robot-specific frames (PSOLQR defaults to base_link, our robot uses base_footprint) -->
+    <param name="/move_base/psolqr_planner/PsoLqrPlanner/base_frame" value="$(arg base_frame)"/>
+    <param name="/move_base/psolqr_planner/PsoLqrPlanner/map_frame" value="$(arg map_frame)"/>
+
+    <!-- Tune LQR velocity limits for this robot -->
+    <param name="/move_base/psolqr_planner/PsoLqrPlanner/max_v" value="0.26"/>
+    <param name="/move_base/psolqr_planner/PsoLqrPlanner/max_w" value="1.0"/>
+    <param name="/move_base/psolqr_planner/PsoLqrPlanner/max_v_inc" value="0.3"/>
+    <param name="/move_base/psolqr_planner/PsoLqrPlanner/max_w_inc" value="1.0"/>
+
+    <!-- ======== Layer 5: explore_lite ======== -->
+
+    <node pkg="explore_lite" type="explore" respawn="false" name="explore" output="screen"
+          launch-prefix="bash -c 'sleep 10; exec $0 $@'">
+        <param name="robot_base_frame" value="$(arg base_frame)"/>
+        <param name="costmap_topic" value="move_base/global_costmap/costmap"/>
+        <param name="costmap_updates_topic" value="move_base/global_costmap/costmap_updates"/>
+        <param name="visualize" value="true"/>
+        <param name="planner_frequency" value="3.0"/>
+        <param name="progress_timeout" value="15.0"/>
+        <param name="potential_scale" value="5.0"/>
+        <param name="orientation_scale" value="0.0"/>
+        <param name="gain_scale" value="1.0"/>
+        <param name="transform_tolerance" value="0.8"/>
+        <param name="min_frontier_size" value="0.05"/>
+    </node>
+
+</launch>

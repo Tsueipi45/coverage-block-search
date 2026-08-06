@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# ROS / catkin
+build/
+devel/
+install/
+logs/
+.catkin_tools/
+*.bag
+*.bag.active
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
